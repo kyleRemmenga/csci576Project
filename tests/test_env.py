@@ -6,7 +6,7 @@ import numpy as np
 
 from shapez_rl.client import RlApiError, ShapezClient
 from shapez_rl.env import ShapezBuildEnv
-from shapez_rl.fake_api import HUB_INPUT, FakeShapezServer
+from shapez_rl.fake_api import FakeShapezServer
 
 
 def fingerprint(observation):
@@ -112,14 +112,27 @@ class EnvTest(unittest.TestCase):
         self.assertTrue(occupied[20, 20])
 
     def test_failed_placement_is_recorded_not_raised(self):
-        env = self.make_env(placement_budget=2)
+        """Only the hub blocks. Verified against the real API on 2026-08-02."""
+        env = self.make_env(placement_budget=1)
         env.reset(seed=13)
         belt = env.buildings.index("belt")
-        # Same tile twice: the second must be rejected and counted, not thrown.
-        env.step(np.array([belt, 20, 20, 0]))
-        _obs, _r, _term, _t, info = env.step(np.array([belt, 20, 20, 0]))
-        self.assertEqual(info["placements_succeeded"], 1)
+        # Window-local (14, 14) -> world (-2, -2), the hub's corner.
+        _obs, _r, _term, _t, info = env.step(np.array([belt, 14, 14, 0]))
+        self.assertEqual(info["placements_succeeded"], 0)
         self.assertIn("placement-blocked", info["placement_failures"])
+
+    def test_placement_replaces_removable_buildings(self):
+        """Occupied tiles are not blocked - the real API replaces, issuing a new uid."""
+        client = ShapezClient(self.server.base_url)
+        client.reset(seed=13)
+        first = client.place_building("belt", 8, 8, rotation=0)
+        second = client.place_building("miner", 8, 8, rotation=0, variant="chainable")
+        self.assertNotEqual(first["entityUid"], second["entityUid"])
+
+        window = client.map_window(7, 7, 3, 3, compact=True)
+        at_tile = [row for row in window["buildings"] if (row[1], row[2]) == (8, 8)]
+        self.assertEqual(len(at_tile), 1)
+        self.assertEqual(at_tile[0][0], "miner")
 
     def test_miner_uses_catalogue_variant_not_default(self):
         """The default-variant trap: an unlocked miner only offers `chainable`."""
@@ -133,37 +146,31 @@ class EnvTest(unittest.TestCase):
         self.assertEqual(caught.exception.error, "invalid-variant")
 
 
-    def test_reward_tracks_delivered_shapes(self):
-        """A miner on a shape patch belted to the hub should score."""
-        env = self.make_env(placement_budget=1, run_ticks=3000)
+    def test_reward_is_the_delta_over_the_reset_baseline(self):
+        """Reward arithmetic only. End-to-end delivery is covered in test_expert."""
+        env = self.make_env(placement_budget=1, run_ticks=600)
         env.reset(seed=42)
+        self.server.game.stored_shapes["CuCuCuCu"] = 7
 
-        game = self.server.game
-        patch = next(
-            ((x, y) for (x, y), (kind, _key) in game.resources.items() if kind == "shape"),
-            None,
-        )
-        self.assertIsNotNone(patch, "seed 42 should contain a shape patch")
-
-        client = ShapezClient(self.server.base_url)
-        client.place_building("miner", patch[0], patch[1], rotation=0, variant="chainable")
-        # Straight belt run from the patch to the hub input.
-        for x in range(min(patch[0], HUB_INPUT[0]) + 1, max(patch[0], HUB_INPUT[0]) + 1):
-            try:
-                client.place_building("belt", x, patch[1], rotation=90)
-            except RlApiError:
-                pass
-        for y in range(min(patch[1], HUB_INPUT[1]), max(patch[1], HUB_INPUT[1]) + 1):
-            try:
-                client.place_building("belt", HUB_INPUT[0], y, rotation=0)
-            except RlApiError:
-                pass
-
-        env._map_cache = env._fetch_map()
         _obs, reward, terminated, _t, info = env.step(np.array([0, 0, 0, 0]))
         self.assertTrue(terminated)
-        self.assertGreater(info["delivered"], 0, "belted miner delivered nothing")
-        self.assertGreater(reward, 0)
+        self.assertEqual(info["delivered"], 7)
+        self.assertEqual(reward, 7.0)
+
+    def test_baseline_is_resnapshotted_each_episode(self):
+        """A stale baseline would carry the previous episode's score into this one."""
+        env = self.make_env(placement_budget=1, run_ticks=600)
+
+        env.reset(seed=42)
+        self.server.game.stored_shapes["CuCuCuCu"] = 5
+        _obs, _reward, _term, _t, first = env.step(np.array([0, 0, 0, 0]))
+        self.assertEqual(first["delivered"], 5)
+
+        env.reset(seed=42)
+        self.server.game.stored_shapes["CuCuCuCu"] = 2
+        _obs, reward, _term, _t, second = env.step(np.array([0, 0, 0, 0]))
+        self.assertEqual(second["delivered"], 2)
+        self.assertEqual(reward, 2.0)
 
     def test_target_shape_scores_only_that_shape(self):
         env = self.make_env(target_shape="ZzZzZzZz", placement_budget=1)

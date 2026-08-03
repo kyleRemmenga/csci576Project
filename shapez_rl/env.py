@@ -1,10 +1,6 @@
-"""Gymnasium environment for shapez.
+"""Gymnasium environment for shapez."""
 
-Step model is build-budget-then-run: the agent places up to ``placement_budget``
-buildings while the simulation is frozen, then the factory runs for ``run_ticks``
-and is scored on what it delivered. Credit is assigned to a whole layout rather
-than to individual placements
-"""
+import sys
 
 import gymnasium as gym
 import numpy as np
@@ -14,6 +10,12 @@ from .client import RlApiError, ShapezClient, hub_level, map_seed, stored_shapes
 from .encoding import DEFAULT_BUILDINGS, ROTATIONS, MapEncoder
 
 DEFAULT_BOUNDS = {"x": -16, "y": -16, "w": 32, "h": 32}
+
+# Used only when GET /rl/buildings is missing. Headless unlocks every reward, and an
+# unlocked miner then reports "chainable" as its only variant - the default is
+# dropped, not added to - so asking for the default fails with invalid-variant.
+# Delete this once the catalogue endpoint exists.
+FALLBACK_VARIANTS = {"miner": "chainable"}
 
 
 class ShapezBuildEnv(gym.Env):
@@ -61,12 +63,18 @@ class ShapezBuildEnv(gym.Env):
         self._failures = {}
         self._baseline = {}
         self._variant_for = {}
+        self._warned = set()
+
+    def _warn_once(self, key, message):
+        if key not in self._warned:
+            self._warned.add(key)
+            print(f"warning: {message}", file=sys.stderr)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
         map_seed_request = None if seed is None else int(seed) % (2**32)
-        state = self.client.reset(seed=map_seed_request)
+        state = self._reset_episode(map_seed_request)
 
         self._placements_used = 0
         self._placed_ok = 0
@@ -107,7 +115,13 @@ class ShapezBuildEnv(gym.Env):
         pass
 
     def action_masks(self):
-        """Boolean mask over the flattened (type, col, row, rotation) action space."""
+        """Boolean mask over the flattened (type, col, row, rotation) action space.
+
+        Deliberately conservative: the API allows placing onto an occupied tile
+        (it replaces, only the hub blocks), but overwriting spends placement budget
+        to undo your own work, so occupied tiles are masked out. Not a bug - relax
+        it only if the agent needs to repair mistakes.
+        """
         free = ~self.encoder.occupancy(self._map_cache)
         per_tile = free.T[np.newaxis, :, :, np.newaxis]
         mask = np.broadcast_to(
@@ -125,9 +139,39 @@ class ShapezBuildEnv(gym.Env):
             ROTATIONS[rotation_index],
         )
 
+    def _reset_episode(self, map_seed_request):
+        """Start a fresh episode, degrading if /rl/reset is missing."""
+        try:
+            return self.client.reset(seed=map_seed_request)
+        except RlApiError as ex:
+            if ex.status != 404:
+                raise
+
+        self._warn_once(
+            "reset",
+            "POST /rl/reset is missing; falling back to destroy-removable-buildings. "
+            "hubGoals and the map do NOT reset and the seed is ignored - single "
+            "episodes only, do not train against this.",
+        )
+        self.client.destroy_removable_buildings()
+        return self.client.gamestate()
+
     def _refresh_variants(self):
-        """Learn each building's legal variant from the API."""
-        catalogue = self.client.buildings()
+        """Learn each building's legal variant, degrading if the catalogue is missing."""
+        try:
+            catalogue = self.client.buildings()
+        except RlApiError as ex:
+            if ex.status != 404:
+                raise
+            self._warn_once(
+                "buildings",
+                "GET /rl/buildings is missing; falling back to "
+                f"{FALLBACK_VARIANTS}. Other buildings will use their default "
+                "variant, which may be rejected.",
+            )
+            self._variant_for = dict(FALLBACK_VARIANTS)
+            return
+
         self._variant_for = {
             entry["id"]: entry["variants"][0]["variant"]
             for entry in catalogue["buildings"]

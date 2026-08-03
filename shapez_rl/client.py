@@ -1,9 +1,4 @@
-"""HTTP client for the shapez RL API.
-
-Speaks the vocabulary in API_CONTRACT.md and does no interpretation - encoding and
-reward logic live elsewhere. Note that parts of the contract are not implemented in
-the game yet; see fake_api.py for an offline stand-in.
-"""
+"""HTTP client for the shapez RL API."""
 
 import json
 import urllib.error
