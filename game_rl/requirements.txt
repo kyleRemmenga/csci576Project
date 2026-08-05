@@ -1,0 +1,5 @@
+gymnasium>=0.29
+numpy>=1.24
+
+# Training only, and it pulls in torch:
+sb3-contrib>=2.9
