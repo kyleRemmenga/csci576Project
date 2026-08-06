@@ -13,10 +13,13 @@ import sys
 import numpy as np
 from sb3_contrib import MaskablePPO
 
+from shapez_rl.encoding import DEFAULT_BUILDINGS
+
 from shapez_rl.env import ShapezBuildEnv
 from shapez_rl.expert import run_episode as run_expert_episode
 from shapez_rl.fake_api import FakeShapezServer
 from shapez_rl.wrappers import FlatAction
+from train import bounds_arg, buildings_arg
 
 
 def run_policy_episode(env, model, seed, deterministic):
@@ -88,6 +91,18 @@ def main():
     parser.add_argument("--budget", type=int, default=24, help="Buildings placed per episode")
     parser.add_argument("--ticks", type=int, default=3000, help="Ticks in the run phase")
     parser.add_argument("--target-shape", default=None, help="Score one shape, e.g. CuCuCuCu")
+    parser.add_argument(
+        "--bounds",
+        type=bounds_arg,
+        default=None,
+        help="Play area as x,y,w,h; must match what the model trained on",
+    )
+    parser.add_argument(
+        "--buildings",
+        type=buildings_arg,
+        default=DEFAULT_BUILDINGS,
+        help="Comma-separated subset; must match what the model trained on",
+    )
     parser.add_argument("--seed-start", type=int, default=1000, help="First map seed")
     parser.add_argument("--seed", type=int, default=0, help="Random baseline's RNG seed")
     parser.add_argument("--deterministic", action="store_true", help="Argmax instead of sampling")
@@ -106,11 +121,21 @@ def main():
     env = FlatAction(
         ShapezBuildEnv(
             base_url=base_url,
+            bounds=args.bounds,
+            buildings=args.buildings,
             placement_budget=args.budget,
             run_ticks=args.ticks,
             target_shape=args.target_shape,
         )
     )
+
+    expected = model.observation_space.shape
+    actual = env.observation_space.shape
+    if expected != actual:
+        raise SystemExit(
+            f"model expects observations {expected} but this env produces {actual}; "
+            "pass the --bounds and --buildings the model was trained with"
+        )
 
     try:
         evaluate(env, model, args)

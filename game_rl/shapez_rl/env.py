@@ -7,13 +7,43 @@ import numpy as np
 from gymnasium import spaces
 
 from .client import RlApiError, ShapezClient, hub_level, map_seed, stored_shapes
-from .encoding import DEFAULT_BUILDINGS, ROTATIONS, MapEncoder
+from .encoding import DEFAULT_BUILDINGS, ROTATIONS, MapEncoder, iter_resources
 
 DEFAULT_BOUNDS = {"x": -16, "y": -16, "w": 32, "h": 32}
 
 
 # Delete this once the catalogue endpoint exists.
 FALLBACK_VARIANTS = {"miner": "chainable"}
+
+
+def _dump(payload):
+    savegame = payload.get("savegame")
+    return savegame.get("dump", {}) if savegame else {}
+
+
+def belt_item_keys(payload):
+    """Distinct item keys riding on belts right now.
+    """
+    keys = set()
+    for path in _dump(payload).get("beltPaths", []):
+        for entry in path.get("items", []):
+            item = entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else None
+            if isinstance(item, dict) and item.get("data"):
+                keys.add(item["data"])
+    return keys
+
+
+def hub_goal_shape(payload):
+    """Shape key the hub currently wants, read off its wire pin."""
+    for entity in _dump(payload).get("entities", []):
+        pins = entity.get("components", {}).get("WiredPins")
+        if not pins:
+            continue
+        for slot in pins.get("slots", []):
+            value = slot.get("value") or {}
+            if value.get("$") == "shape" and value.get("data"):
+                return value["data"]
+    return None
 
 
 class ShapezBuildEnv(gym.Env):
@@ -30,6 +60,8 @@ class ShapezBuildEnv(gym.Env):
         buildings=DEFAULT_BUILDINGS,
         target_shape=None,
         delivered_reward=1.0,
+        production_bonus=5.0,
+        mining_bonus=1.0,
         placement_penalty=0.0,
         invalid_action_penalty=0.0,
         timeout=30.0,
@@ -41,6 +73,8 @@ class ShapezBuildEnv(gym.Env):
         self.run_ticks = run_ticks
         self.target_shape = target_shape
         self.delivered_reward = delivered_reward
+        self.production_bonus = production_bonus
+        self.mining_bonus = mining_bonus
         self.placement_penalty = placement_penalty
         self.invalid_action_penalty = invalid_action_penalty
 
@@ -62,6 +96,9 @@ class ShapezBuildEnv(gym.Env):
         self._baseline = {}
         self._variant_for = {}
         self._warned = set()
+        self._wanted = set()
+        self._produced = set()
+        self._mined = False
 
     def _warn_once(self, key, message):
         if key not in self._warned:
@@ -78,6 +115,9 @@ class ShapezBuildEnv(gym.Env):
         self._placed_ok = 0
         self._failures = {}
         self._baseline = dict(stored_shapes(state))
+        self._produced = set()
+        self._wanted = self._goal_keys(state)
+        self._mined = False
         self._refresh_variants()
         self._map_cache = self._fetch_map()
 
@@ -90,6 +130,9 @@ class ShapezBuildEnv(gym.Env):
         placed = self._try_place(building_id, x, y, rotation)
         if placed:
             self._placed_ok += 1
+            if not self._mined and self._mines_wanted(building_id, x, y):
+                self._mined = True
+                reward += self.mining_bonus
             # Refetched rather than patched locally: placing a belt changes the
             # rotation variant of its neighbours, so a patched cache would desync.
             self._map_cache = self._fetch_map()
@@ -103,6 +146,7 @@ class ShapezBuildEnv(gym.Env):
         if terminated:
             state = self.client.tick(self.run_ticks)
             reward += self.delivered_reward * self._delivered(state)
+            reward += self.production_bonus * self._newly_produced(state)
             info = self._info(state)
         else:
             info = {"placed": placed}
@@ -196,11 +240,38 @@ class ShapezBuildEnv(gym.Env):
             self.bounds["x"], self.bounds["y"], self.bounds["w"], self.bounds["h"]
         )
 
+    def _goal_keys(self, state):
+        """The shape that counts as progress this episode."""
+        key = self.target_shape if self.target_shape is not None else hub_goal_shape(state)
+        return {key} if key else set()
+
+    def _mines_wanted(self, building_id, x, y):
+        """True if this is a miner sitting on a tile of the goal resource.
+        """
+        if building_id != "miner" or not self._wanted:
+            return False
+        for rx, ry, _kind, key in iter_resources(self._map_cache):
+            if rx == x and ry == y:
+                return key in self._wanted
+        return False
+
+    def _newly_produced(self, state):
+        """Wanted item keys seen on belts for the first time this episode.
+        """
+        if not self._wanted:
+            return 0
+        fresh = (belt_item_keys(state) & self._wanted) - self._produced
+        self._produced |= fresh
+        return len(fresh)
+
     def _info(self, state):
         return {
             "map_seed": map_seed(state),
             "hub_level": hub_level(state),
             "delivered": self._delivered(state),
+            "mined": self._mined,
+            "produced": sorted(self._produced),
+            "wanted": sorted(self._wanted),
             "placements_attempted": self._placements_used,
             "placements_succeeded": self._placed_ok,
             "placement_failures": dict(self._failures),
