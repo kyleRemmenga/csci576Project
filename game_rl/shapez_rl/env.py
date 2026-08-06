@@ -8,6 +8,7 @@ from gymnasium import spaces
 
 from .client import RlApiError, ShapezClient, hub_level, map_seed, stored_shapes
 from .encoding import DEFAULT_BUILDINGS, ROTATIONS, MapEncoder, iter_resources
+from .expert import HUB_INPUT
 
 DEFAULT_BOUNDS = {"x": -16, "y": -16, "w": 32, "h": 32}
 
@@ -46,6 +47,57 @@ def hub_goal_shape(payload):
     return None
 
 
+def _entity_origins(dump):
+    origins = {}
+    for entity in dump.get("entities", []):
+        static = entity.get("components", {}).get("StaticMapEntity", {})
+        origin = static.get("origin")
+        if origin is not None:
+            origins[entity.get("uid")] = (origin["x"], origin["y"])
+    return origins
+
+
+def _path_item_keys(path):
+    keys = set()
+    for entry in path.get("items", []):
+        item = entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else None
+        if isinstance(item, dict) and item.get("data"):
+            keys.add(item["data"])
+    return keys
+
+
+def belt_progress(payload, wanted):
+    """How far the best belt run carrying a wanted item gets toward the hub, 0..1.
+
+    ``entityPath`` is ordered along the flow, so its first tile is where items
+    enter and its last is where they leave. Scoring the fraction of that gap
+    closed means an unfinished chain still earns credit, while belts carrying
+    nothing wanted are skipped so paving the map earns nothing.
+    """
+    if not wanted:
+        return 0.0
+
+    dump = _dump(payload)
+    origins = _entity_origins(dump)
+    best = 0.0
+
+    for path in dump.get("beltPaths", []):
+        entity_path = path.get("entityPath") or []
+        if not entity_path or not (_path_item_keys(path) & wanted):
+            continue
+        source = origins.get(entity_path[0])
+        end = origins.get(entity_path[-1])
+        if source is None or end is None:
+            continue
+        span = abs(source[0] - HUB_INPUT[0]) + abs(source[1] - HUB_INPUT[1])
+        if span <= 0:
+            continue
+        remaining = abs(end[0] - HUB_INPUT[0]) + abs(end[1] - HUB_INPUT[1])
+        best = max(best, (span - remaining) / span)
+
+    return min(best, 1.0)
+
+
 class ShapezBuildEnv(gym.Env):
     """Place a budget of buildings, then run the factory and score it."""
 
@@ -61,6 +113,7 @@ class ShapezBuildEnv(gym.Env):
         target_shape=None,
         delivered_reward=1.0,
         production_bonus=5.0,
+        route_bonus=5.0,
         mining_bonus=1.0,
         placement_penalty=0.0,
         invalid_action_penalty=0.0,
@@ -74,6 +127,7 @@ class ShapezBuildEnv(gym.Env):
         self.target_shape = target_shape
         self.delivered_reward = delivered_reward
         self.production_bonus = production_bonus
+        self.route_bonus = route_bonus
         self.mining_bonus = mining_bonus
         self.placement_penalty = placement_penalty
         self.invalid_action_penalty = invalid_action_penalty
@@ -99,6 +153,7 @@ class ShapezBuildEnv(gym.Env):
         self._wanted = set()
         self._produced = set()
         self._mined = False
+        self._progress = 0.0
 
     def _warn_once(self, key, message):
         if key not in self._warned:
@@ -118,6 +173,7 @@ class ShapezBuildEnv(gym.Env):
         self._produced = set()
         self._wanted = self._goal_keys(state)
         self._mined = False
+        self._progress = 0.0
         self._refresh_variants()
         self._map_cache = self._fetch_map()
 
@@ -147,6 +203,8 @@ class ShapezBuildEnv(gym.Env):
             state = self.client.tick(self.run_ticks)
             reward += self.delivered_reward * self._delivered(state)
             reward += self.production_bonus * self._newly_produced(state)
+            self._progress = belt_progress(state, self._wanted)
+            reward += self.route_bonus * self._progress
             info = self._info(state)
         else:
             info = {"placed": placed}
@@ -271,6 +329,7 @@ class ShapezBuildEnv(gym.Env):
             "delivered": self._delivered(state),
             "mined": self._mined,
             "produced": sorted(self._produced),
+            "progress": round(self._progress, 3),
             "wanted": sorted(self._wanted),
             "placements_attempted": self._placements_used,
             "placements_succeeded": self._placed_ok,

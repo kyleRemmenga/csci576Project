@@ -9,6 +9,7 @@ import os
 import sys
 
 from sb3_contrib import MaskablePPO
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -64,7 +65,7 @@ def make_env(base_url, budget, ticks, target_shape, servers, bounds, buildings, 
         return Monitor(
             FlatAction(env),
             filename=log_path,
-            info_keywords=("mined", "delivered", "placements_succeeded"),
+            info_keywords=("mined", "progress", "delivered", "placements_succeeded"),
         )
 
     return _init
@@ -90,6 +91,7 @@ def build_model(venv, args):
         ent_coef=args.ent_coef,
         vf_coef=0.5,
         max_grad_norm=0.5,
+        target_kl=args.target_kl,
         seed=args.seed,
         verbose=1,
         tensorboard_log=args.tensorboard,
@@ -123,10 +125,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None, help="Default: one episode")
     parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    # Stops an update once the policy has moved too far, which prevents collapse.
+    parser.add_argument("--target-kl", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--tensorboard", default=None, help="Log dir; omit to disable")
     parser.add_argument("--save", default="runs/ppo_shapez", help="Checkpoint path, no extension")
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=10_000,
+        help="Timesteps between snapshots; 0 to keep only the final save",
+    )
     parser.add_argument(
         "--log-dir",
         default="runs/logs",
@@ -174,9 +184,24 @@ def main():
         ]
     )
 
+    callbacks = []
+    if args.checkpoint_freq > 0:
+        # save_freq counts steps per env, so scale it to mean total timesteps.
+        callbacks.append(
+            CheckpointCallback(
+                save_freq=max(1, args.checkpoint_freq // args.n_envs),
+                save_path=os.path.dirname(args.save) or ".",
+                name_prefix=os.path.basename(args.save),
+            )
+        )
+
     try:
         model = build_model(venv, args)
-        model.learn(total_timesteps=args.timesteps, progress_bar=False)
+        model.learn(
+            total_timesteps=args.timesteps,
+            callback=callbacks or None,
+            progress_bar=False,
+        )
         model.save(args.save)
         print(f"\nsaved {args.save}.zip")
     finally:
