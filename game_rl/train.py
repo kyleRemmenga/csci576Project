@@ -8,14 +8,16 @@ import argparse
 import os
 import sys
 
+import numpy as np
+import torch as th
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from shapez_rl.encoding import DEFAULT_BUILDINGS, ROTATIONS
 from shapez_rl.env import ShapezBuildEnv
-from shapez_rl.expert import HUB_TILE
+from shapez_rl.expert import HUB_TILE, ScriptedMiner
 from shapez_rl.fake_api import FakeShapezServer
 from shapez_rl.policy import SpatialMaskablePolicy
 from shapez_rl.wrappers import FlatAction
@@ -29,6 +31,16 @@ def bounds_arg(text):
     if w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError("width and height must be positive")
     return {"x": x, "y": y, "w": w, "h": h}
+
+
+def base_urls_arg(text):
+    urls = tuple(url.strip().rstrip("/") for url in text.split(",") if url.strip())
+    if not urls:
+        raise argparse.ArgumentTypeError("expected at least one URL")
+    if len(set(urls)) != len(urls):
+        # Two envs sharing one game would interleave their episodes into one world.
+        raise argparse.ArgumentTypeError("each env needs its own game; URLs must be distinct")
+    return urls
 
 
 def buildings_arg(text):
@@ -99,9 +111,81 @@ def build_model(venv, args):
     )
 
 
+def collect_expert(env_fn, episodes, target_shape, seed_start=0):
+    """Roll out the scripted expert, recording (observation, flat action) pairs.
+
+    Builds its own env rather than borrowing one from the vec env, because
+    SubprocVecEnv keeps its envs in other processes where the expert cannot
+    reach the live map cache it needs.
+    """
+    env = env_fn()
+    flat_env = env.env
+    inner = flat_env.env
+
+    observations, actions, skipped = [], [], 0
+    try:
+        for index in range(episodes):
+            obs, _info = env.reset(seed=seed_start + index)
+            agent = ScriptedMiner(inner, target_shape=target_shape)
+            if agent.reset(inner._map_cache) == 0:
+                skipped += 1
+                continue
+
+            terminated = False
+            while not terminated:
+                flat = flat_env.flatten_action(agent.act())
+                observations.append(obs)
+                actions.append(flat)
+                obs, _reward, terminated, _truncated, _info = env.step(flat)
+    finally:
+        env.close()
+
+    if skipped:
+        print(f"  {skipped} episode(s) had no routable patch and were skipped")
+    return np.asarray(observations, dtype=np.float32), np.asarray(actions, dtype=np.int64)
+
+
+def behavior_clone(model, observations, actions, epochs, batch_size=64):
+    """Supervised pretraining so PPO starts from a policy that already delivers."""
+    policy = model.policy
+    obs_t = th.as_tensor(observations, device=policy.device)
+    act_t = th.as_tensor(actions, device=policy.device)
+    count = len(act_t)
+
+    policy.set_training_mode(True)
+    for epoch in range(epochs):
+        order = th.randperm(count, device=policy.device)
+        total = 0.0
+        for start in range(0, count, batch_size):
+            batch = order[start : start + batch_size]
+            distribution = policy.get_distribution(obs_t[batch])
+            loss = -distribution.log_prob(act_t[batch]).mean()
+
+            policy.optimizer.zero_grad()
+            loss.backward()
+            th.nn.utils.clip_grad_norm_(policy.parameters(), model.max_grad_norm)
+            policy.optimizer.step()
+            total += loss.item() * len(batch)
+
+        accuracy = _clone_accuracy(policy, obs_t, act_t)
+        print(f"  bc epoch {epoch + 1}/{epochs}  loss {total / count:.4f}  match {accuracy:.0%}")
+
+
+def _clone_accuracy(policy, obs_t, act_t, limit=2048):
+    with th.no_grad():
+        sample = obs_t[:limit]
+        predicted = policy.get_distribution(sample).distribution.probs.argmax(dim=-1)
+        return (predicted == act_t[: len(sample)]).float().mean().item()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default=None, help="Real API; omit to use the fake")
+    parser.add_argument(
+        "--base-url",
+        type=base_urls_arg,
+        default=None,
+        help="Real API; comma-separate one URL per env. Omit to use the fake",
+    )
     parser.add_argument("--timesteps", type=int, default=200_000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--budget", type=int, default=24, help="Buildings placed per episode")
@@ -125,6 +209,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None, help="Default: one episode")
     parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--bc-episodes",
+        type=int,
+        default=0,
+        help="Expert episodes to imitate before PPO; 0 disables the warm start",
+    )
+    parser.add_argument("--bc-epochs", type=int, default=10)
     # Stops an update once the policy has moved too far, which prevents collapse.
     parser.add_argument("--target-kl", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -151,6 +242,11 @@ def main():
 
     if args.base_url is None:
         print("no --base-url given, using the offline fake API\n")
+    elif len(args.base_url) != args.n_envs:
+        parser.error(
+            f"got {len(args.base_url)} URL(s) but --n-envs {args.n_envs}; "
+            "pass one running game per env"
+        )
 
     if args.bounds is not None:
         hub_x, hub_y = HUB_TILE
@@ -168,21 +264,29 @@ def main():
         os.makedirs(log_dir, exist_ok=True)
         print(f"per-episode CSV -> {os.path.join(log_dir, '<n>.monitor.csv')}\n")
 
-    venv = DummyVecEnv(
-        [
-            make_env(
-                args.base_url,
-                args.budget,
-                args.ticks,
-                args.target_shape,
-                servers,
-                args.bounds,
-                args.buildings,
-                os.path.join(log_dir, str(i)) if log_dir else None,
-            )
-            for i in range(args.n_envs)
-        ]
-    )
+    def env_fn(index, log_path):
+        return make_env(
+            args.base_url[index] if args.base_url else None,
+            args.budget,
+            args.ticks,
+            args.target_shape,
+            servers,
+            args.bounds,
+            args.buildings,
+            log_path,
+        )
+
+    env_fns = [
+        env_fn(i, os.path.join(log_dir, str(i)) if log_dir else None)
+        for i in range(args.n_envs)
+    ]
+
+    # DummyVecEnv steps envs one after another, so real games only overlap under
+    # SubprocVecEnv. The fake API is fast enough that process overhead costs more.
+    parallel = args.n_envs > 1 and args.base_url is not None
+    if parallel:
+        print(f"stepping {args.n_envs} games in parallel via SubprocVecEnv\n")
+    venv = SubprocVecEnv(env_fns) if parallel else DummyVecEnv(env_fns)
 
     callbacks = []
     if args.checkpoint_freq > 0:
@@ -197,6 +301,15 @@ def main():
 
     try:
         model = build_model(venv, args)
+        if args.bc_episodes > 0:
+            print(f"collecting {args.bc_episodes} expert episodes")
+            # No log path: this env's episodes are demonstrations, not training.
+            observations, actions = collect_expert(
+                env_fn(0, None), args.bc_episodes, args.target_shape
+            )
+            print(f"behaviour cloning on {len(actions)} expert actions")
+            behavior_clone(model, observations, actions, args.bc_epochs)
+
         model.learn(
             total_timesteps=args.timesteps,
             callback=callbacks or None,

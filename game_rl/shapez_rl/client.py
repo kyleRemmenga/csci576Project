@@ -1,9 +1,8 @@
 """HTTP client for the shapez RL API."""
 
+import http.client
 import json
-import urllib.error
 import urllib.parse
-import urllib.request
 
 
 class RlApiError(RuntimeError):
@@ -26,6 +25,19 @@ class ShapezClient:
     def __init__(self, base_url="http://127.0.0.1:17872", timeout=30.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        parsed = urllib.parse.urlsplit(self.base_url)
+        self._host = parsed.hostname
+        self._port = parsed.port or 80
+        self._conn = None
+
+    def _connection(self):
+        # A fresh HTTPConnection per request exhausts Windows' socket buffers
+        # over long runs (WinError 10055), so keep one alive and reuse it.
+        if self._conn is None:
+            self._conn = http.client.HTTPConnection(
+                self._host, self._port, timeout=self.timeout
+            )
+        return self._conn
 
     def _request(self, path, method="GET", payload=None, timeout=None):
         data = None
@@ -34,22 +46,29 @@ class ShapezClient:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        request = urllib.request.Request(
-            self.base_url + path, data=data, headers=headers, method=method
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as ex:
-            body = ex.read().decode("utf-8", "replace")
+        last_error = None
+        for attempt in range(2):
             try:
-                error = json.loads(body).get("error", body)
+                conn = self._connection()
+                conn.request(method, path, body=data, headers=headers)
+                response = conn.getresponse()
+                body = response.read()
+                break
+            except (http.client.HTTPException, OSError) as ex:
+                self._conn = None
+                last_error = ex
+        else:
+            raise RlApiUnavailable(f"{self.base_url}{path}: {last_error}") from last_error
+
+        if response.status >= 400:
+            text = body.decode("utf-8", "replace")
+            try:
+                error = json.loads(text).get("error", text)
             except json.JSONDecodeError:
-                error = body
-            raise RlApiError(ex.code, error, path) from ex
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as ex:
-            raise RlApiUnavailable(f"{self.base_url}{path}: {ex}") from ex
+                error = text
+            raise RlApiError(response.status, error, path)
+
+        return json.loads(body.decode("utf-8"))
 
     def reset(self, seed=None):
         """Start a fresh episode, optionally on a chosen map seed."""
