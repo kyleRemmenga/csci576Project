@@ -32,6 +32,11 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:17872")
     parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated seeds to play back-to-back in one recording, e.g. 1000,1005,1014",
+    )
     parser.add_argument("--delay", type=float, default=0.6, help="Seconds between placements")
     parser.add_argument("--lead-in", type=float, default=3.0, help="Pause after reset, to start recording")
     parser.add_argument("--run-chunks", type=int, default=20, help="Extra visible tick batches after the build")
@@ -60,32 +65,36 @@ def main():
         )
     )
 
+    seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
+
     try:
-        obs, _info = env.reset(seed=args.seed)
-        print(f"seed {args.seed} loaded; recording starts in {args.lead_in:.0f}s")
-        time.sleep(args.lead_in)
+        for episode_index, seed in enumerate(seeds):
+            obs, _info = env.reset(seed=seed)
+            print(f"\n=== episode {episode_index + 1}/{len(seeds)}  seed {seed} ===")
+            print(f"seed {seed} loaded; recording starts in {args.lead_in:.0f}s")
+            time.sleep(args.lead_in)
 
-        step, terminated, reward, info = 0, False, 0.0, {}
-        while not terminated:
-            action, _state = model.predict(
-                obs, action_masks=env.action_masks(), deterministic=not args.sample
+            step, terminated, reward, info = 0, False, 0.0, {}
+            while not terminated:
+                action, _state = model.predict(
+                    obs, action_masks=env.action_masks(), deterministic=not args.sample
+                )
+                print(f"  {step + 1:>2}/{args.budget}  {describe(env, int(action))}")
+                obs, reward, terminated, _truncated, info = env.step(action)
+                step += 1
+                if not terminated:
+                    time.sleep(args.delay)
+
+            print(
+                f"\nreward {reward:.1f}  delivered {info['delivered']}  "
+                f"progress {info['progress']:.2f}  placed {info['placements_succeeded']}"
             )
-            print(f"  {step + 1:>2}/{args.budget}  {describe(env, int(action))}")
-            obs, reward, terminated, _truncated, info = env.step(action)
-            step += 1
-            if not terminated:
-                time.sleep(args.delay)
 
-        print(
-            f"\nreward {reward:.1f}  delivered {info['delivered']}  "
-            f"progress {info['progress']:.2f}  placed {info['placements_succeeded']}"
-        )
-
-        for round_index in range(args.run_chunks):
-            state = env.env.client.tick(args.chunk_ticks)
-            stored = sum(stored_shapes(state).values())
-            print(f"  run {round_index + 1:>2}/{args.run_chunks}  stored shapes {stored}")
-            time.sleep(args.chunk_delay)
+            for round_index in range(args.run_chunks):
+                state = env.env.client.tick(args.chunk_ticks)
+                stored = sum(stored_shapes(state).values())
+                print(f"  run {round_index + 1:>2}/{args.run_chunks}  stored shapes {stored}")
+                time.sleep(args.chunk_delay)
     finally:
         env.close()
 
