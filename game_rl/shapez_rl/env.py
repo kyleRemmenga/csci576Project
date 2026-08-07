@@ -8,7 +8,7 @@ from gymnasium import spaces
 
 from .client import RlApiError, ShapezClient, hub_level, map_seed, stored_shapes
 from .encoding import DEFAULT_BUILDINGS, ROTATIONS, MapEncoder, iter_resources
-from .expert import HUB_INPUT
+from .expert import HUB_INPUT, source_shapes, waste_shapes
 
 DEFAULT_BOUNDS = {"x": -16, "y": -16, "w": 32, "h": 32}
 
@@ -64,38 +64,6 @@ def _path_item_keys(path):
         if isinstance(item, dict) and item.get("data"):
             keys.add(item["data"])
     return keys
-
-
-def source_shapes(shape_key):
-    """Raw mined shapes a goal shape is processed from.
-
-    A goal like ``----CuCu`` is never mined directly; it comes out of a cutter fed
-    with ``CuCuCuCu``. Without this the mining and routing bonuses never fire for
-    processed goals and the reward collapses to all-or-nothing.
-    """
-    if not shape_key or len(shape_key) != 8:
-        return set()
-    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
-    filled = [q for q in quadrants if q != "--"]
-    if not filled or len(filled) == 4:
-        return set()
-    return {filled[0] * 4}
-
-
-def waste_shapes(shape_key):
-    """The offcut a cutter produces alongside a half-shape goal.
-
-    A cutter emits both halves and stalls if either output backs up, so the
-    offcut has to be belted away. Seeing it move is the signal that the agent
-    solved the jam rather than getting one lucky delivery.
-    """
-    if not shape_key or len(shape_key) != 8:
-        return set()
-    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
-    filled = [q for q in quadrants if q != "--"]
-    if not filled or len(filled) == 4:
-        return set()
-    return {"".join("--" if q != "--" else filled[0] for q in quadrants)}
 
 
 def belt_progress(payload, wanted):

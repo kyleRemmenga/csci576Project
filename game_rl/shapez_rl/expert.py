@@ -15,6 +15,43 @@ HUB_TILE = (-2, 1)
 DIRECTION_TO_ROTATION = {(0, -1): 0, (1, 0): 90, (0, 1): 180, (-1, 0): 270}
 
 MAX_CANDIDATES = 12
+MAX_CUTTER_SITES = 40
+
+# Which of the cutter's two ejectors carries the goal half. Verified against the
+# live game rather than read off the source, since the cut order is not obvious.
+GOAL_OUTPUT_SLOT = 0
+
+
+def source_shapes(shape_key):
+    """Raw mined shapes a goal shape is processed from.
+
+    A goal like ``----CuCu`` is never mined directly; it comes out of a cutter fed
+    with ``CuCuCuCu``. Without this the mining and routing bonuses never fire for
+    processed goals and the reward collapses to all-or-nothing.
+    """
+    if not shape_key or len(shape_key) != 8:
+        return set()
+    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
+    filled = [q for q in quadrants if q != "--"]
+    if not filled or len(filled) == 4:
+        return set()
+    return {filled[0] * 4}
+
+
+def waste_shapes(shape_key):
+    """The offcut a cutter produces alongside a half-shape goal.
+
+    A cutter emits both halves and stalls if either output backs up, so the
+    offcut has to be belted away. Seeing it move is the signal that the agent
+    solved the jam rather than getting one lucky delivery.
+    """
+    if not shape_key or len(shape_key) != 8:
+        return set()
+    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
+    filled = [q for q in quadrants if q != "--"]
+    if not filled or len(filled) == 4:
+        return set()
+    return {"".join("--" if q != "--" else filled[0] for q in quadrants)}
 
 
 def direction_to_rotation(a, b):
@@ -108,6 +145,96 @@ def plan_mining_line(map_payload, bounds, target_shape=None):
     return None
 
 
+def _in_bounds(tile, bounds):
+    return (
+        bounds["x"] <= tile[0] < bounds["x"] + bounds["w"]
+        and bounds["y"] <= tile[1] < bounds["y"] + bounds["h"]
+    )
+
+
+def _belts_along(route, final_target):
+    """A belt on every tile of ``route``, each pointing at the next one."""
+    belts = []
+    for index, tile in enumerate(route):
+        nxt = route[index + 1] if index + 1 < len(route) else final_target
+        belts.append(("belt", tile[0], tile[1], direction_to_rotation(tile, nxt)))
+    return belts
+
+
+def _cutter_geometry(origin):
+    """Tiles a rotation-0 cutter uses: (body, input, slot-0 out, slot-1 out).
+
+    The default cutter is 2x1. Its acceptor sits on the left tile facing
+    ``bottom``, so items enter from below; both ejectors face ``top``, so the
+    two halves come out of the tiles directly above the body.
+    """
+    cx, cy = origin
+    body = ((cx, cy), (cx + 1, cy))
+    return body, (cx, cy + 1), (cx, cy - 1), (cx + 1, cy - 1)
+
+
+def _cutter_plan_at(origin, patch, blocked, bounds, goal_slot):
+    body, feed_tile, out_a, out_b = _cutter_geometry(origin)
+    goal_out, waste_out = (out_a, out_b) if goal_slot == 0 else (out_b, out_a)
+
+    used = set(body) | {feed_tile, out_a, out_b}
+    if any(not _in_bounds(t, bounds) or t in blocked for t in used):
+        return None
+
+    # The offcut has to keep moving or the cutter stalls, so the trash sits
+    # right on the waste ejector and never needs a belt of its own.
+    hub_route = find_route(goal_out, HUB_INPUT, blocked | set(body) | {feed_tile, waste_out}, bounds)
+    if hub_route is None:
+        return None
+
+    feed_route = find_route(patch, feed_tile, blocked | set(body) | {out_a, out_b} | set(hub_route), bounds)
+    if feed_route is None or len(feed_route) < 2:
+        return None
+
+    # Placement order matters: the game snaps a belt towards whatever acceptor is
+    # already next to it, so a trash placed before the goal belt steals the cut
+    # half. Building the trash last leaves the goal belt pointing at the hub.
+    return (
+        [("miner", patch[0], patch[1], direction_to_rotation(patch, feed_route[1]))]
+        + _belts_along(feed_route[1:], body[0])
+        + [("cutter", origin[0], origin[1], 0)]
+        + _belts_along(hub_route, HUB_TILE)
+        + [("trash", waste_out[0], waste_out[1], 0)]
+    )
+
+
+def plan_cutter_line(map_payload, bounds, source_shape, goal_slot=0, budget=None):
+    """Plan miner -> belt -> cutter, one half to the hub and the offcut to a trash.
+
+    ``source_shape`` is the raw shape to mine (``CuCuCuCu`` for a ``----CuCu``
+    goal); the goal itself is never on the map, so planning has to target the
+    material the cutter is fed with.
+    """
+    blocked = occupied_tiles(map_payload)
+    patches = [p for p in shape_patches(map_payload, source_shape) if p not in blocked]
+    if not patches:
+        return None
+
+    patches.sort(key=lambda p: abs(p[0] - HUB_INPUT[0]) + abs(p[1] - HUB_INPUT[1]))
+
+    # Cutter sites near the hub keep the post-cut belt run short, which matters
+    # because every tile of it eats into the placement budget.
+    sites = [
+        (x, y)
+        for x in range(bounds["x"], bounds["x"] + bounds["w"] - 1)
+        for y in range(bounds["y"] + 1, bounds["y"] + bounds["h"] - 1)
+    ]
+    sites.sort(key=lambda s: abs(s[0] - HUB_INPUT[0]) + abs(s[1] - HUB_INPUT[1]))
+
+    for patch in patches[:MAX_CANDIDATES]:
+        for site in sites[:MAX_CUTTER_SITES]:
+            plan = _cutter_plan_at(site, patch, blocked, bounds, goal_slot)
+            if plan and (budget is None or len(plan) <= budget):
+                return plan
+
+    return None
+
+
 def plan_to_actions(plan, env):
     """Convert ``(building_id, x, y, rotation)`` tuples into env actions."""
     actions = []
@@ -139,10 +266,23 @@ class ScriptedMiner:
 
     def reset(self, map_payload):
         """Plan from the current map. Returns the number of planned placements."""
-        self.plan = plan_mining_line(map_payload, self.env.bounds, self.target_shape)
+        self.plan = self._plan(map_payload)
         self._queue = plan_to_actions(self.plan, self.env) if self.plan else []
         self._route = {(x, y) for _id, x, y, _rot in (self.plan or [])}
         return len(self._queue)
+
+    def _plan(self, map_payload):
+        """A cut goal needs a cutter; a raw goal is just a mining line."""
+        sources = source_shapes(self.target_shape)
+        if sources and {"cutter", "trash"} <= set(self.env.buildings):
+            return plan_cutter_line(
+                map_payload,
+                self.env.bounds,
+                next(iter(sources)),
+                goal_slot=GOAL_OUTPUT_SLOT,
+                budget=self.env.placement_budget,
+            )
+        return plan_mining_line(map_payload, self.env.bounds, self.target_shape)
 
     def act(self):
         """Next planned action, or harmless filler once the plan is done."""
