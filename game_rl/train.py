@@ -122,7 +122,7 @@ def collect_expert(env_fn, episodes, target_shape, seed_start=0):
     flat_env = env.env
     inner = flat_env.env
 
-    observations, actions, skipped = [], [], 0
+    observations, actions, returns, skipped = [], [], [], 0
     try:
         for index in range(episodes):
             obs, _info = env.reset(seed=seed_start + index)
@@ -131,44 +131,71 @@ def collect_expert(env_fn, episodes, target_shape, seed_start=0):
                 skipped += 1
                 continue
 
+            episode_rewards = []
             terminated = False
             while not terminated:
                 flat = flat_env.flatten_action(agent.act())
                 observations.append(obs)
                 actions.append(flat)
-                obs, _reward, terminated, _truncated, _info = env.step(flat)
+                obs, reward, terminated, _truncated, _info = env.step(flat)
+                episode_rewards.append(reward)
+
+            # gamma is 1.0, so the target for each step is the reward still to come.
+            total = 0.0
+            to_go = []
+            for reward in reversed(episode_rewards):
+                total += reward
+                to_go.append(total)
+            returns.extend(reversed(to_go))
     finally:
         env.close()
 
     if skipped:
         print(f"  {skipped} episode(s) had no routable patch and were skipped")
-    return np.asarray(observations, dtype=np.float32), np.asarray(actions, dtype=np.int64)
+    return (
+        np.asarray(observations, dtype=np.float32),
+        np.asarray(actions, dtype=np.int64),
+        np.asarray(returns, dtype=np.float32),
+    )
 
 
-def behavior_clone(model, observations, actions, epochs, batch_size=64):
-    """Supervised pretraining so PPO starts from a policy that already delivers."""
+def behavior_clone(model, observations, actions, returns, epochs, batch_size=64):
+    """Supervised pretraining so PPO starts from a policy that already delivers.
+
+    Fits the critic alongside the actor: leaving the value head at its random
+    initialisation makes PPO's first advantages meaningless, and those updates
+    undo the imitated policy before the critic ever catches up.
+    """
     policy = model.policy
     obs_t = th.as_tensor(observations, device=policy.device)
     act_t = th.as_tensor(actions, device=policy.device)
+    ret_t = th.as_tensor(returns, device=policy.device)
     count = len(act_t)
 
     policy.set_training_mode(True)
     for epoch in range(epochs):
         order = th.randperm(count, device=policy.device)
-        total = 0.0
+        action_total, value_total = 0.0, 0.0
         for start in range(0, count, batch_size):
             batch = order[start : start + batch_size]
             distribution = policy.get_distribution(obs_t[batch])
-            loss = -distribution.log_prob(act_t[batch]).mean()
+            action_loss = -distribution.log_prob(act_t[batch]).mean()
+            values = policy.predict_values(obs_t[batch]).flatten()
+            value_loss = th.nn.functional.mse_loss(values, ret_t[batch])
+            loss = action_loss + model.vf_coef * value_loss
 
             policy.optimizer.zero_grad()
             loss.backward()
             th.nn.utils.clip_grad_norm_(policy.parameters(), model.max_grad_norm)
             policy.optimizer.step()
-            total += loss.item() * len(batch)
+            action_total += action_loss.item() * len(batch)
+            value_total += value_loss.item() * len(batch)
 
         accuracy = _clone_accuracy(policy, obs_t, act_t)
-        print(f"  bc epoch {epoch + 1}/{epochs}  loss {total / count:.4f}  match {accuracy:.0%}")
+        print(
+            f"  bc epoch {epoch + 1}/{epochs}  loss {action_total / count:.4f}"
+            f"  value {value_total / count:.3f}  match {accuracy:.0%}"
+        )
 
 
 def _clone_accuracy(policy, obs_t, act_t, limit=2048):
@@ -304,11 +331,14 @@ def main():
         if args.bc_episodes > 0:
             print(f"collecting {args.bc_episodes} expert episodes")
             # No log path: this env's episodes are demonstrations, not training.
-            observations, actions = collect_expert(
+            observations, actions, returns = collect_expert(
                 env_fn(0, None), args.bc_episodes, args.target_shape
             )
             print(f"behaviour cloning on {len(actions)} expert actions")
-            behavior_clone(model, observations, actions, args.bc_epochs)
+            behavior_clone(model, observations, actions, returns, args.bc_epochs)
+            # Baseline for "did PPO add anything on top of imitation?"
+            model.save(f"{args.save}_bc")
+            print(f"saved {args.save}_bc.zip")
 
         model.learn(
             total_timesteps=args.timesteps,
