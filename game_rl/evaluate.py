@@ -92,6 +92,12 @@ def main():
     parser.add_argument("--ticks", type=int, default=3000, help="Ticks in the run phase")
     parser.add_argument("--target-shape", default=None, help="Score one shape, e.g. CuCuCuCu")
     parser.add_argument(
+        "--goal-level",
+        type=int,
+        default=None,
+        help="Hub level to start at; must match what the model trained on",
+    )
+    parser.add_argument(
         "--bounds",
         type=bounds_arg,
         default=None,
@@ -126,6 +132,7 @@ def main():
             placement_budget=args.budget,
             run_ticks=args.ticks,
             target_shape=args.target_shape,
+            goal_level=args.goal_level,
         )
     )
 

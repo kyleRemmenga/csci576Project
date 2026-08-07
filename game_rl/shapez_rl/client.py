@@ -70,9 +70,13 @@ class ShapezClient:
 
         return json.loads(body.decode("utf-8"))
 
-    def reset(self, seed=None):
-        """Start a fresh episode, optionally on a chosen map seed."""
-        return self._request("/rl/reset", method="POST", payload={"seed": seed})
+    def reset(self, seed=None, goal_level=None):
+        """Start a fresh episode, optionally on a chosen map seed and hub level."""
+        payload = {"seed": seed}
+        if goal_level is not None:
+            # Sets the hub goal and unlocks every building earned up to that level.
+            payload["goalLevel"] = int(goal_level)
+        return self._request("/rl/reset", method="POST", payload=payload)
 
     def gamestate(self):
         """Full savegame dump. Debugging only - step loops want the compact forms."""

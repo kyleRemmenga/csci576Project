@@ -66,6 +66,38 @@ def _path_item_keys(path):
     return keys
 
 
+def source_shapes(shape_key):
+    """Raw mined shapes a goal shape is processed from.
+
+    A goal like ``----CuCu`` is never mined directly; it comes out of a cutter fed
+    with ``CuCuCuCu``. Without this the mining and routing bonuses never fire for
+    processed goals and the reward collapses to all-or-nothing.
+    """
+    if not shape_key or len(shape_key) != 8:
+        return set()
+    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
+    filled = [q for q in quadrants if q != "--"]
+    if not filled or len(filled) == 4:
+        return set()
+    return {filled[0] * 4}
+
+
+def waste_shapes(shape_key):
+    """The offcut a cutter produces alongside a half-shape goal.
+
+    A cutter emits both halves and stalls if either output backs up, so the
+    offcut has to be belted away. Seeing it move is the signal that the agent
+    solved the jam rather than getting one lucky delivery.
+    """
+    if not shape_key or len(shape_key) != 8:
+        return set()
+    quadrants = [shape_key[i:i + 2] for i in range(0, 8, 2)]
+    filled = [q for q in quadrants if q != "--"]
+    if not filled or len(filled) == 4:
+        return set()
+    return {"".join("--" if q != "--" else filled[0] for q in quadrants)}
+
+
 def belt_progress(payload, wanted):
     """How far the best belt run carrying a wanted item gets toward the hub, 0..1.
 
@@ -111,9 +143,12 @@ class ShapezBuildEnv(gym.Env):
         run_ticks=3000,
         buildings=DEFAULT_BUILDINGS,
         target_shape=None,
+        goal_level=None,
         delivered_reward=1.0,
         production_bonus=5.0,
         route_bonus=5.0,
+        waste_bonus=2.0,
+        source_route_scale=0.4,
         mining_bonus=1.0,
         placement_penalty=0.0,
         invalid_action_penalty=0.0,
@@ -125,9 +160,12 @@ class ShapezBuildEnv(gym.Env):
         self.placement_budget = placement_budget
         self.run_ticks = run_ticks
         self.target_shape = target_shape
+        self.goal_level = goal_level
         self.delivered_reward = delivered_reward
         self.production_bonus = production_bonus
         self.route_bonus = route_bonus
+        self.waste_bonus = waste_bonus
+        self.source_route_scale = source_route_scale
         self.mining_bonus = mining_bonus
         self.placement_penalty = placement_penalty
         self.invalid_action_penalty = invalid_action_penalty
@@ -151,9 +189,12 @@ class ShapezBuildEnv(gym.Env):
         self._variant_for = {}
         self._warned = set()
         self._wanted = set()
+        self._sources = set()
+        self._waste = set()
         self._produced = set()
         self._mined = False
         self._progress = 0.0
+        self._waste_routed = False
 
     def _warn_once(self, key, message):
         if key not in self._warned:
@@ -172,8 +213,14 @@ class ShapezBuildEnv(gym.Env):
         self._baseline = dict(stored_shapes(state))
         self._produced = set()
         self._wanted = self._goal_keys(state)
+        self._sources = set()
+        self._waste = set()
+        for key in self._wanted:
+            self._sources |= source_shapes(key)
+            self._waste |= waste_shapes(key)
         self._mined = False
         self._progress = 0.0
+        self._waste_routed = False
         self._refresh_variants()
         self._map_cache = self._fetch_map()
 
@@ -203,8 +250,10 @@ class ShapezBuildEnv(gym.Env):
             state = self.client.tick(self.run_ticks)
             reward += self.delivered_reward * self._delivered(state)
             reward += self.production_bonus * self._newly_produced(state)
-            self._progress = belt_progress(state, self._wanted)
-            reward += self.route_bonus * self._progress
+            reward += self.route_bonus * self._route_credit(state)
+            if self._waste and (belt_item_keys(state) & self._waste):
+                self._waste_routed = True
+                reward += self.waste_bonus
             info = self._info(state)
         else:
             info = {"placed": placed}
@@ -236,7 +285,7 @@ class ShapezBuildEnv(gym.Env):
     def _reset_episode(self, map_seed_request):
         """Start a fresh episode, degrading if /rl/reset is missing."""
         try:
-            return self.client.reset(seed=map_seed_request)
+            return self.client.reset(seed=map_seed_request, goal_level=self.goal_level)
         except RlApiError as ex:
             if ex.status != 404:
                 raise
@@ -306,12 +355,25 @@ class ShapezBuildEnv(gym.Env):
     def _mines_wanted(self, building_id, x, y):
         """True if this is a miner sitting on a tile of the goal resource.
         """
-        if building_id != "miner" or not self._wanted:
+        useful = self._wanted | self._sources
+        if building_id != "miner" or not useful:
             return False
         for rx, ry, _kind, key in iter_resources(self._map_cache):
             if rx == x and ry == y:
-                return key in self._wanted
+                return key in useful
         return False
+
+    def _route_credit(self, state):
+        """Routing score, discounted while the belt still carries raw material.
+
+        Hauling uncut shapes to the hub is a dead end, so it earns only a
+        fraction: enough to find the hub, not enough to beat cutting.
+        """
+        self._progress = belt_progress(state, self._wanted)
+        if not self._sources:
+            return self._progress
+        raw = belt_progress(state, self._sources)
+        return max(self._progress, self.source_route_scale * raw)
 
     def _newly_produced(self, state):
         """Wanted item keys seen on belts for the first time this episode.
@@ -329,6 +391,7 @@ class ShapezBuildEnv(gym.Env):
             "delivered": self._delivered(state),
             "mined": self._mined,
             "produced": sorted(self._produced),
+            "waste_routed": self._waste_routed,
             "progress": round(self._progress, 3),
             "wanted": sorted(self._wanted),
             "placements_attempted": self._placements_used,

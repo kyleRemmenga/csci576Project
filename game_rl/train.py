@@ -55,7 +55,8 @@ def buildings_arg(text):
     return names
 
 
-def make_env(base_url, budget, ticks, target_shape, servers, bounds, buildings, log_path=None):
+def make_env(base_url, budget, ticks, target_shape, servers, bounds, buildings,
+             log_path=None, goal_level=None):
     """Env factory. With no base_url, each env gets its own fake server."""
 
     def _init():
@@ -72,12 +73,13 @@ def make_env(base_url, budget, ticks, target_shape, servers, bounds, buildings, 
             placement_budget=budget,
             run_ticks=ticks,
             target_shape=target_shape,
+            goal_level=goal_level,
         )
         # info_keywords lands the reward-ladder rungs in the CSV alongside reward.
         return Monitor(
             FlatAction(env),
             filename=log_path,
-            info_keywords=("mined", "progress", "delivered", "placements_succeeded"),
+            info_keywords=("mined", "progress", "delivered", "waste_routed", "placements_succeeded"),
         )
 
     return _init
@@ -219,6 +221,12 @@ def main():
     parser.add_argument("--ticks", type=int, default=3000, help="Ticks in the run phase")
     parser.add_argument("--target-shape", default=None, help="Score one shape, e.g. CuCuCuCu")
     parser.add_argument(
+        "--goal-level",
+        type=int,
+        default=None,
+        help="Hub level to start at; 2 unlocks the cutter, 3 the balancer",
+    )
+    parser.add_argument(
         "--bounds",
         type=bounds_arg,
         default=None,
@@ -301,6 +309,7 @@ def main():
             args.bounds,
             args.buildings,
             log_path,
+            args.goal_level,
         )
 
     env_fns = [
